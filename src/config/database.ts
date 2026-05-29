@@ -133,9 +133,9 @@ class SlowQueryPool extends Pool {
  */
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  max: 20,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
+  max: 50,
+  idleTimeoutMillis: 15000,
+  connectionTimeoutMillis: 5000,
 });
 
 // Wrap query for slow-query logging while preserving Pool typings.
@@ -187,9 +187,9 @@ const replicaPools: Pool[] = replicaUrls.map(
   (url) =>
     new Pool({
       connectionString: url,
-      max: 10,
-      idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 2000,
+      max: 30,
+      idleTimeoutMillis: 15000,
+      connectionTimeoutMillis: 5000,
     }),
 );
 

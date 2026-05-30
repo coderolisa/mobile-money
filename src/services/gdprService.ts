@@ -1,5 +1,23 @@
 import crypto from "node:crypto";
 import { promises as fs } from "node:fs";
+import { DeleteObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
+import { getS3Client, s3Config } from "../config/s3";
+
+  async deleteUserS3Objects(userId: string) {
+    const s3 = getS3Client();
+    const prefix = `${userId}/`;
+    try {
+      const listResult = await s3.send(new ListObjectsV2Command({ Bucket: s3Config.bucket, Prefix: prefix }));
+      const objects = listResult.Contents || [];
+      for (const obj of objects) {
+        if (obj.Key) {
+          await s3.send(new DeleteObjectCommand({ Bucket: s3Config.bucket, Key: obj.Key }));
+        }
+      }
+    } catch (err) {
+      console.error("S3 deletion error for user", userId, err);
+    }
+  }
 import path from "node:path";
 import { v4 as uuid } from "uuid";
 import { Transaction, TransactionModel } from "../models/transaction";

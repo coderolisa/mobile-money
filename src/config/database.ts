@@ -1,4 +1,7 @@
 import { Pool, QueryConfig, QueryResult, QueryResultRow, PoolClient } from "pg";
+import { isReadOnlyQuery } from "../utils/readOnlyDetector";
+import { IS_SANDBOX, SANDBOX_DATABASE_URL, DATABASE_URL } from "./env";
+
 
 // Configuration for slow query logging
 const SLOW_QUERY_THRESHOLD_MS = parseInt(
@@ -125,15 +128,16 @@ class SlowQueryPool extends Pool {
 }
 
 /**
- * Primary connection pool – handles all write operations
+ * Primary connection pool – now routes through PgBouncer for transaction-level pooling
+ * This significantly reduces the number of direct connections to Postgres
  * (INSERT, UPDATE, DELETE) and read operations when no replica is available.
  */
 export const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  max: 20,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
-});
+    connectionString: IS_SANDBOX ? (SANDBOX_DATABASE_URL || DATABASE_URL) : DATABASE_URL,
+    max: 1000,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 500,
+  });
 
 // Wrap query for slow-query logging while preserving Pool typings.
 const originalPoolQuery = pool.query.bind(pool);
@@ -180,15 +184,15 @@ const replicaUrls: string[] = process.env.READ_REPLICA_URL
   : [];
 
 // Build an individual Pool for each replica URL
-const replicaPools: Pool[] = replicaUrls.map(
-  (url) =>
-    new Pool({
-      connectionString: url,
-      max: 10,
-      idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 2000,
-    }),
-);
+  const replicaPools: Pool[] = replicaUrls.map(
+    (url) =>
+      new Pool({
+        connectionString: url,
+        max: 50,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 500,
+      }),
+  );
 
 // Track which replica to use next for round-robin load balancing
 let replicaIndex = 0;
@@ -232,12 +236,13 @@ export async function queryRead<T extends import("pg").QueryResultRow = any>(
     }
   }
 
-  // Fall back: use primary pool
+  // Fall back: use primary pool (which goes through PgBouncer)
   return pool.query<T>(text, params);
 }
 
 /**
  * Execute a write SQL query (INSERT / UPDATE / DELETE) against the primary pool.
+ * All writes now route through PgBouncer via the primary pool connection.
  *
  * @param text   - The parameterised SQL query string
  * @param params - Optional query parameters
@@ -270,4 +275,151 @@ export async function checkReplicaHealth(): Promise<
       }
     }),
   );
+}
+
+/**
+ * Smart query router: automatically detects read-only (SELECT) queries and
+ * routes them to replica pools, while routing writes (INSERT/UPDATE/DELETE) to primary.
+ * This enables transparent replica usage without changing existing code patterns.
+ *
+ * @param text   - The parameterised SQL query string
+ * @param params - Optional query parameters
+ */
+export async function querySmart<T extends import("pg").QueryResultRow = any>(
+  text: string,
+  params?: unknown[],
+): Promise<import("pg").QueryResult<T>> {
+  // Auto-detect if this is a read-only query
+  if (isReadOnlyQuery(text)) {
+    return queryRead<T>(text, params);
+  } else {
+    return queryWrite<T>(text, params);
+  }
+}
+
+/**
+ * Get PgBouncer pool statistics
+ * Queries PgBouncer admin database to get connection pool metrics
+ */
+export async function getPgBouncerStats(): Promise<{
+  activeConnections: number;
+  idleConnections: number;
+  totalConnections: number;
+  clientConnections: number;
+}> {
+  try {
+    // Query PgBouncer stats database (special admin database)
+    const pgbouncerPool = new Pool({
+      connectionString: process.env.PGBOUNCER_ADMIN_URL || "postgresql://user:password@localhost:6432/pgbouncer",
+    });
+
+    const result = await pgbouncerPool.query(
+      "SELECT sum(cl_active) as active, sum(cl_idle) as idle, sum(sv_active) as sv_active, sum(sv_idle) as sv_idle FROM pgbouncer.client_lookup;",
+    );
+
+    await pgbouncerPool.end();
+
+    const row = result.rows[0] || {};
+    return {
+      activeConnections: parseInt(row.sv_active || 0),
+      idleConnections: parseInt(row.sv_idle || 0),
+      totalConnections: (parseInt(row.sv_active || 0) + parseInt(row.sv_idle || 0)),
+      clientConnections: (parseInt(row.cl_active || 0) + parseInt(row.cl_idle || 0)),
+    };
+  } catch (err) {
+    console.warn("Failed to get PgBouncer stats:", err);
+    return {
+      activeConnections: 0,
+      idleConnections: 0,
+      totalConnections: 0,
+      clientConnections: 0,
+    };
+  }
+}
+
+/**
+ * Context-aware query function that respects HTTP method-based routing decisions.
+ * 
+ * This function is designed to work with the readReplicaRoutingMiddleware.
+ * It routes queries based on:
+ * 1. HTTP method context (if provided) - GET requests go to replica
+ * 2. SQL query type (fallback) - SELECT queries go to replica
+ * 
+ * Usage in route handlers:
+ *   const result = await queryWithContext(req, "SELECT * FROM users", []);
+ * 
+ * @param req - Express Request object (with dbRouting context from middleware)
+ * @param text - SQL query string
+ * @param params - Query parameters
+ * @returns Query result
+ */
+export async function queryWithContext<
+  T extends import("pg").QueryResultRow = any,
+>(
+  req: any,
+  text: string,
+  params?: unknown[],
+): Promise<import("pg").QueryResult<T>> {
+  // Check for HTTP method-based routing context
+  if (req?.dbRouting?.useReplicaPool) {
+    return queryRead<T>(text, params);
+  }
+
+  // Fall back to SQL query-based routing
+  return querySmart<T>(text, params);
+}
+
+/**
+ * Batch query execution with request context.
+ * Executes multiple queries with proper pool routing based on HTTP method.
+ * 
+ * All read operations (GET) use replica, all writes use primary.
+ * 
+ * @param req - Express Request object
+ * @param queries - Array of { text, params } query configurations
+ * @returns Array of query results
+ */
+export async function queryBatchWithContext<
+  T extends import("pg").QueryResultRow = any,
+>(
+  req: any,
+  queries: Array<{ text: string; params?: unknown[] }>,
+): Promise<import("pg").QueryResult<T>[]> {
+  const results: import("pg").QueryResult<T>[] = [];
+
+  for (const query of queries) {
+    const result = await queryWithContext<T>(req, query.text, query.params);
+    results.push(result);
+  }
+
+  return results;
+}
+
+/**
+ * Get database pool statistics combining primary and replica metrics.
+ * Useful for monitoring and health check endpoints.
+ */
+export async function getPoolStats(): Promise<{
+  primary: {
+    mode: "normal" | "failover";
+    url: string;
+    description: string;
+  };
+  replicas: Array<{
+    url: string;
+    healthy: boolean;
+  }>;
+}> {
+  const replicaStats = await checkReplicaHealth();
+
+  return {
+    primary: {
+      mode: isDRMode() ? "failover" : "normal",
+      url: DR_DATABASE_URL || process.env.DATABASE_URL || "",
+      description: isDRMode()
+        ? "Running in DR failover mode - writes redirected to promoted replica"
+        : "Primary database - all critical writes",
+    },
+    replicas: replicaStats,
+  };
 }

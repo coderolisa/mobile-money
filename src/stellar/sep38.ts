@@ -1,37 +1,57 @@
+/**
+ * SEP-38 — Quote Server & Dynamic Price Streams
+ *
+ * Endpoints:
+ *   GET  /sep38/info       – List supported asset pairs
+ *   GET  /sep38/prices     – Indicative price for a pair
+ *   GET  /sep38/price      – Alias for /prices (singular form)
+ *   POST /sep38/quote      – Create a firm quote (stored in Redis with TTL)
+ *   GET  /sep38/quote/:id  – Retrieve a stored quote by ID
+ *
+ * Quote persistence: Redis (key: `sep38:quote:<id>`, TTL = quote lifetime).
+ * Falls back to NodeCache when Redis is unavailable, so the service degrades
+ * gracefully in local dev without Redis.
+ *
+ * Zod validation schemas live in src/openapi/schemas/sep38.ts and are
+ * imported here for runtime validation — keeping schema definitions DRY.
+ */
+
 import { Router, Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
 import NodeCache from "node-cache";
 import rateLimit from "express-rate-limit";
-import { currencyService, SupportedCurrency } from "../services/currency";
+import { z } from "zod";
+import { rateProvider } from "../services/sep38/rateProvider";
+import { redisClient } from "../config/redis";
+import {
+  Sep38QuoteRequestSchema,
+  Sep38PriceQuerySchema,
+} from "../openapi/schemas/sep38";
 
 const router = Router();
 
-// Strict rate limiter for SEP-38 endpoints (similar to SEP-31)
-const sep38Limiter = process.env.NODE_ENV === "test" 
-  ? (req: any, res: any, next: any) => next()
-  : rateLimit({
-      windowMs: 60 * 1000, // 1 minute
-      max: 30, // Limit each IP to 30 requests per window
-      standardHeaders: true,
-      legacyHeaders: false,
-      message: {
-        error: "Too many requests, please try again later.",
-      },
-    });
+// ─── Rate limiter ─────────────────────────────────────────────────────────────
 
-// Cache for quotes with TTL support (60 seconds default as per spec)
-const quoteCache = new NodeCache({ stdTTL: 60, checkperiod: 10 });
+const sep38Limiter =
+  process.env.NODE_ENV === "test"
+    ? (req: any, res: any, next: any) => next()
+    : rateLimit({
+        windowMs: 60 * 1000, // 1 minute
+        max: 30,
+        standardHeaders: true,
+        legacyHeaders: false,
+        message: { error: "Too many requests, please try again later." },
+      });
 
-// Supported asset pairs configuration
+// ─── NodeCache fallback (used when Redis is unavailable) ──────────────────────
+
+const localQuoteCache = new NodeCache({ stdTTL: 60, checkperiod: 10 });
+
+// ─── Interfaces ───────────────────────────────────────────────────────────────
+
 interface AssetPair {
   sell_asset: string;
   buy_asset: string;
-}
-
-interface Price {
-  sell_asset: string;
-  buy_asset: string;
-  price: string;
 }
 
 interface Quote {
@@ -42,382 +62,311 @@ interface Quote {
   sell_amount: string;
   buy_amount: string;
   price: string;
+  fee_percent: string;
+  fee_fixed: string;
   created_at: string;
 }
 
-interface InfoResponse {
-  assets: AssetPair[];
-}
+// ─── Supported asset pairs ────────────────────────────────────────────────────
 
-interface PricesResponse extends Price {
-  [key: string]: any;
-}
-
-interface ErrorResponse {
-  error: string;
-}
-
-// Supported asset pairs - can be configured via environment variables
-// Includes main assets: XAF, USDC (on Stellar), USD (ISO4217), XLM
 const SUPPORTED_ASSET_PAIRS: AssetPair[] = [
-  { sell_asset: "stellar:USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN", buy_asset: "iso4217:USD" },
-  { sell_asset: "iso4217:USD", buy_asset: "stellar:USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
+  {
+    sell_asset: "stellar:USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+    buy_asset: "iso4217:USD",
+  },
+  {
+    sell_asset: "iso4217:USD",
+    buy_asset: "stellar:USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+  },
   { sell_asset: "stellar:XLM", buy_asset: "iso4217:USD" },
   { sell_asset: "iso4217:USD", buy_asset: "stellar:XLM" },
-  { sell_asset: "stellar:XLM", buy_asset: "stellar:USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
-  { sell_asset: "stellar:USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN", buy_asset: "stellar:XLM" },
-  { sell_asset: "iso4217:XAF", buy_asset: "stellar:USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN" },
-  { sell_asset: "stellar:USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN", buy_asset: "iso4217:XAF" },
+  {
+    sell_asset: "stellar:XLM",
+    buy_asset: "stellar:USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+  },
+  {
+    sell_asset: "stellar:USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+    buy_asset: "stellar:XLM",
+  },
+  {
+    sell_asset: "iso4217:XAF",
+    buy_asset: "stellar:USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+  },
+  {
+    sell_asset: "stellar:USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+    buy_asset: "iso4217:XAF",
+  },
   { sell_asset: "iso4217:XAF", buy_asset: "stellar:XLM" },
   { sell_asset: "stellar:XLM", buy_asset: "iso4217:XAF" },
 ];
 
-/**
- * SEP-38 Exchange Rate Service
- * Handles conversion between different asset types and provides price information
- */
-class ExchangeRateService {
-  private mapToCurrencyCode(asset: string): string | null {
-    if (asset === "stellar:XLM") return "XLM";
-    if (asset.startsWith("iso4217:")) return asset.split(":")[1];
-    if (asset.startsWith("stellar:USDC:")) return "USD";
-    return null;
-  }
+// ─── Redis quote helpers ──────────────────────────────────────────────────────
 
-  /**
-   * Get the current exchange rate between two assets
-   */
-  async getPrice(sellAsset: string, buyAsset: string): Promise<string | null> {
-    const sellCode = this.mapToCurrencyCode(sellAsset);
-    const buyCode = this.mapToCurrencyCode(buyAsset);
+const REDIS_KEY_PREFIX = "sep38:quote:";
 
-    if (!sellCode || !buyCode) return null;
-
-    let rate: number = 1.0;
-
-    try {
-      // Integrate with CurrencyService for live rates
-      if (sellCode === "XLM" || buyCode === "XLM") {
-        const xlmPriceUsd = 0.12; // Dynamic placeholder for XLM price
-        if (sellCode === "XLM" && buyCode === "USD") rate = xlmPriceUsd;
-        else if (sellCode === "USD" && buyCode === "XLM") rate = 1 / xlmPriceUsd;
-        else if (sellCode === "XLM") {
-          const conversion = currencyService.convert(1, "USD", buyCode as SupportedCurrency);
-          rate = xlmPriceUsd * conversion.rate;
-        } else if (buyCode === "XLM") {
-          const conversion = currencyService.convertToBase(1, sellCode as SupportedCurrency);
-          rate = conversion.rate / xlmPriceUsd;
-        }
-      } else {
-        rate = currencyService.convert(1, sellCode as SupportedCurrency, buyCode as SupportedCurrency).rate;
-      }
-    } catch (e) {
-      console.error("Error converting currency:", e);
-      return null;
+async function storeQuote(quote: Quote, ttlSeconds: number): Promise<void> {
+  const key = `${REDIS_KEY_PREFIX}${quote.id}`;
+  const serialised = JSON.stringify(quote);
+  try {
+    if (redisClient.isOpen) {
+      await redisClient.setEx(key, ttlSeconds, serialised);
+      return;
     }
-
-    // Add small variation to simulate dynamic market rates (±0.1%)
-    const variation = 1 + (Math.random() - 0.5) * 0.001;
-    const adjustedRate = rate * variation;
-    
-    return adjustedRate.toFixed(7);
+  } catch (err) {
+    console.warn("SEP-38: Redis write failed, falling back to NodeCache", err);
   }
-
-  /**
-   * Generate a quote for a conversion between two assets
-   */
-  async getQuote(
-    sellAsset: string,
-    buyAsset: string,
-    sellAmount?: string,
-    buyAmount?: string
-  ): Promise<{ sellAmount: string; buyAmount: string; price: string } | null> {
-    const price = await this.getPrice(sellAsset, buyAsset);
-    
-    if (!price) {
-      return null;
-    }
-
-    const priceNum = parseFloat(price);
-    let sAmt: string = "";
-    let bAmt: string = "";
-
-    if (sellAmount) {
-      sAmt = sellAmount;
-      bAmt = (parseFloat(sellAmount) * priceNum).toFixed(7);
-    } else if (buyAmount) {
-      bAmt = buyAmount;
-      sAmt = (parseFloat(buyAmount) / priceNum).toFixed(7);
-    }
-
-    return { sellAmount: sAmt, buyAmount: bAmt, price };
-  }
+  // Fallback: NodeCache (single-instance only)
+  localQuoteCache.set(quote.id, quote, ttlSeconds);
 }
 
-const exchangeRateService = new ExchangeRateService();
+async function retrieveQuote(id: string): Promise<Quote | null> {
+  const key = `${REDIS_KEY_PREFIX}${id}`;
+  try {
+    if (redisClient.isOpen) {
+      const raw = await redisClient.get(key);
+      return raw ? (JSON.parse(raw) as Quote) : null;
+    }
+  } catch (err) {
+    console.warn("SEP-38: Redis read failed, falling back to NodeCache", err);
+  }
+  return localQuoteCache.get<Quote>(id) ?? null;
+}
+
+async function deleteQuote(id: string): Promise<void> {
+  try {
+    if (redisClient.isOpen) {
+      await redisClient.del(`${REDIS_KEY_PREFIX}${id}`);
+    }
+  } catch {
+    /* no-op */
+  }
+  localQuoteCache.del(id);
+}
+
+// ─── Route helpers ────────────────────────────────────────────────────────────
+
+function isSupportedPair(sellAsset: string, buyAsset: string): boolean {
+  return SUPPORTED_ASSET_PAIRS.some(
+    (p) => p.sell_asset === sellAsset && p.buy_asset === buyAsset,
+  );
+}
+
+// ─── GET /info ────────────────────────────────────────────────────────────────
 
 /**
- * GET /info
- * 
- * Returns supported asset pairs for conversion
- * Used by wallets to discover available conversion paths
+ * Returns the list of supported asset conversion pairs.
+ * Wallets call this first to discover available routes.
  */
-router.get("/info", sep38Limiter, (req: Request, res: Response) => {
+router.get("/info", sep38Limiter, (_req: Request, res: Response) => {
   try {
-    const info: InfoResponse = {
-      assets: SUPPORTED_ASSET_PAIRS.map(pair => ({
-        sell_asset: pair.sell_asset,
-        buy_asset: pair.buy_asset
-      }))
-    };
-    res.json(info);
+    res.json({ assets: SUPPORTED_ASSET_PAIRS });
   } catch (error) {
-    console.error("Error in /info endpoint:", error);
-    res.status(500).json({ error: "Internal server error" } as ErrorResponse);
+    console.error("SEP-38 /info error:", error);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
+// ─── GET /prices ──────────────────────────────────────────────────────────────
+
 /**
- * GET /prices
- * 
- * Get current prices for multiple asset pairs
- * Query Parameters:
- *   - sell_asset: Asset code to convert from
- *   - buy_asset: Asset code to convert to
+ * Returns an indicative (non-binding) exchange rate.
+ * Rates include a small market spread and may fluctuate.
  */
 router.get("/prices", sep38Limiter, async (req: Request, res: Response) => {
   try {
-    const { sell_asset, buy_asset } = req.query;
-    
-    // Validate required parameters
-    if (!sell_asset || !buy_asset) {
-      return res.status(400).json({ 
-        error: "Missing required parameters: sell_asset and buy_asset" 
-      } as ErrorResponse);
+    const parsed = Sep38PriceQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      return res.status(400).json({
+        error: "Validation failed",
+        details: parsed.error.issues,
+      });
     }
 
-    // Validate asset pair is supported
-    const assetPair = SUPPORTED_ASSET_PAIRS.find(
-      pair => pair.sell_asset === sell_asset && pair.buy_asset === buy_asset
-    );
+    const { sell_asset, buy_asset } = parsed.data;
 
-    if (!assetPair) {
-      return res.status(400).json({ 
-        error: "Unsupported asset pair" 
-      } as ErrorResponse);
+    if (!isSupportedPair(sell_asset, buy_asset)) {
+      return res.status(400).json({ error: "Unsupported asset pair" });
     }
 
-    const price = await exchangeRateService.getPrice(sell_asset as string, buy_asset as string);
-    
-    if (!price) {
-      return res.status(500).json({ 
-        error: "Unable to fetch price for asset pair" 
-      } as ErrorResponse);
+    const priceResult = await rateProvider.getIndicativePrice(sell_asset, buy_asset);
+    if (!priceResult) {
+      return res.status(500).json({ error: "Unable to fetch price for asset pair" });
     }
 
-    const priceResponse: PricesResponse = {
-      sell_asset: sell_asset as string,
-      buy_asset: buy_asset as string,
-      price
-    };
-
-    res.json(priceResponse);
+    res.json({
+      sell_asset,
+      buy_asset,
+      price: priceResult.price,
+      fee_percent: priceResult.fee_percent,
+      fee_fixed: priceResult.fee_fixed,
+    });
   } catch (error) {
-    console.error("Error in /prices endpoint:", error);
-    res.status(500).json({ error: "Internal server error" } as ErrorResponse);
+    console.error("SEP-38 /prices error:", error);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
+// ─── GET /price ───────────────────────────────────────────────────────────────
+
 /**
- * GET /price
- * 
- * Get the current price for a specific asset pair (singular endpoint)
- * Query Parameters:
- *   - sell_asset: Asset code to convert from
- *   - buy_asset: Asset code to convert to
+ * Singular-form alias for GET /prices.
+ * Some SEP-38 clients use the singular path; this keeps them compatible.
  */
 router.get("/price", sep38Limiter, async (req: Request, res: Response) => {
   try {
-    const { sell_asset, buy_asset } = req.query;
-    
-    // Validate required parameters
-    if (!sell_asset || !buy_asset) {
-      return res.status(400).json({ 
-        error: "Missing required parameters: sell_asset and buy_asset" 
-      } as ErrorResponse);
+    const parsed = Sep38PriceQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      return res.status(400).json({
+        error: "Validation failed",
+        details: parsed.error.issues,
+      });
     }
 
-    // Validate asset pair is supported
-    const assetPair = SUPPORTED_ASSET_PAIRS.find(
-      pair => pair.sell_asset === sell_asset && pair.buy_asset === buy_asset
-    );
+    const { sell_asset, buy_asset } = parsed.data;
 
-    if (!assetPair) {
-      return res.status(400).json({ 
-        error: "Unsupported asset pair" 
-      } as ErrorResponse);
+    if (!isSupportedPair(sell_asset, buy_asset)) {
+      return res.status(400).json({ error: "Unsupported asset pair" });
     }
 
-    const price = await exchangeRateService.getPrice(sell_asset as string, buy_asset as string);
-    
-    if (!price) {
-      return res.status(500).json({ 
-        error: "Unable to fetch price for asset pair" 
-      } as ErrorResponse);
+    const priceResult = await rateProvider.getIndicativePrice(sell_asset, buy_asset);
+    if (!priceResult) {
+      return res.status(500).json({ error: "Unable to fetch price for asset pair" });
     }
 
-    const priceResponse: Price = {
-      sell_asset: sell_asset as string,
-      buy_asset: buy_asset as string,
-      price
-    };
-
-    res.json(priceResponse);
+    res.json({
+      sell_asset,
+      buy_asset,
+      price: priceResult.price,
+      fee_percent: priceResult.fee_percent,
+      fee_fixed: priceResult.fee_fixed,
+    });
   } catch (error) {
-    console.error("Error in /price endpoint:", error);
-    res.status(500).json({ error: "Internal server error" } as ErrorResponse);
+    console.error("SEP-38 /price error:", error);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
+// ─── POST /quote ──────────────────────────────────────────────────────────────
+
 /**
- * POST /quote
- * 
- * Create a firm quote for a specific conversion
- * The quote is locked in for the specified TTL (default 60 seconds)
- * 
- * Body Parameters:
- *   - sell_asset: Asset code to convert from
- *   - buy_asset: Asset code to convert to
- *   - sell_amount: Amount to sell (optional if buy_amount is provided)
- *   - buy_amount: Amount to buy (optional if sell_amount is provided)
- *   - ttl: Time to live in seconds (optional, max 300, default 60)
+ * Creates a firm, time-locked quote.
+ *
+ * The quote is stored in Redis (key: sep38:quote:<id>) with the TTL configured
+ * by the caller (default 60 s, maximum 300 s). If Redis is unavailable the
+ * quote falls back to NodeCache — it will still work but won't survive restarts.
  */
 router.post("/quote", sep38Limiter, async (req: Request, res: Response) => {
   try {
-    const { sell_asset, buy_asset, sell_amount, buy_amount, ttl } = req.body;
-
-    // Validate required parameters
-    if (!sell_asset || !buy_asset || (!sell_amount && !buy_amount)) {
-      return res.status(400).json({ 
-        error: "Missing required parameters: sell_asset, buy_asset, and either sell_amount or buy_amount" 
-      } as ErrorResponse);
+    // ── 1. Validate request body via Zod schema ──────────────────────────────
+    let body: z.infer<typeof Sep38QuoteRequestSchema>;
+    try {
+      body = Sep38QuoteRequestSchema.parse(req.body);
+    } catch (err) {
+      if (err instanceof z.ZodError) {
+        return res.status(400).json({ error: "Validation failed", details: err.issues });
+      }
+      throw err;
     }
 
-    // Validate asset pair is supported
-    const assetPair = SUPPORTED_ASSET_PAIRS.find(
-      pair => pair.sell_asset === sell_asset && pair.buy_asset === buy_asset
-    );
+    const { sell_asset, buy_asset, sell_amount, buy_amount, ttl } = body;
 
-    if (!assetPair) {
-      return res.status(400).json({ 
-        error: "Unsupported asset pair" 
-      } as ErrorResponse);
+    // ── 2. Validate asset pair ────────────────────────────────────────────────
+    if (!isSupportedPair(sell_asset, buy_asset)) {
+      return res.status(400).json({ error: "Unsupported asset pair" });
     }
 
-    // Validate amounts are positive numbers
+    // ── 3. Fetch firm price from rate provider ────────────────────────────────
+    const firmPriceResult = await rateProvider.getFirmPrice(sell_asset, buy_asset);
+    if (!firmPriceResult) {
+      return res.status(500).json({ error: "Unable to generate quote for asset pair" });
+    }
+
+    const priceNum = parseFloat(firmPriceResult.price);
+
+    // ── 4. Compute amounts ────────────────────────────────────────────────────
+    let sAmt: string;
+    let bAmt: string;
+
     if (sell_amount) {
-      const sellAmountNum = parseFloat(sell_amount);
-      if (isNaN(sellAmountNum) || sellAmountNum <= 0) {
-        return res.status(400).json({ 
-          error: "sell_amount must be a positive number" 
-        } as ErrorResponse);
-      }
+      sAmt = sell_amount;
+      bAmt = (parseFloat(sell_amount) * priceNum).toFixed(7);
+    } else {
+      // buy_amount is guaranteed by Zod refine — one of the two must be set
+      bAmt = buy_amount as string;
+      sAmt = (parseFloat(bAmt) / priceNum).toFixed(7);
     }
 
-    if (buy_amount) {
-      const buyAmountNum = parseFloat(buy_amount);
-      if (isNaN(buyAmountNum) || buyAmountNum <= 0) {
-        return res.status(400).json({ 
-          error: "buy_amount must be a positive number" 
-        } as ErrorResponse);
-      }
-    }
+    // ── 5. Build the quote object ─────────────────────────────────────────────
+    const QUOTE_TTL_DEFAULT = 60;
+    const QUOTE_TTL_MAX = 300;
+    const quoteTTL = ttl
+      ? Math.min(Math.max(ttl, 1), QUOTE_TTL_MAX)
+      : QUOTE_TTL_DEFAULT;
 
-    // Get quote from exchange rate service
-    const quoteData = await exchangeRateService.getQuote(
-      sell_asset,
-      buy_asset,
-      sell_amount,
-      buy_amount
-    );
-
-    if (!quoteData) {
-      return res.status(500).json({ 
-        error: "Unable to generate quote for asset pair" 
-      } as ErrorResponse);
-    }
-
-    // Calculate TTL (Time To Live) in seconds
-    const defaultTTL = 60; // 1 minute default as per spec
-    const quoteTTL = ttl && ttl > 0 ? Math.min(ttl, 300) : defaultTTL; // Max 5 minutes
-
-    // Generate quote ID and expiration time
     const quoteId = uuidv4();
     const createdAt = new Date().toISOString();
     const expiresAt = new Date(Date.now() + quoteTTL * 1000).toISOString();
 
-    // Create quote object
     const quote: Quote = {
       id: quoteId,
       expires_at: expiresAt,
       sell_asset,
       buy_asset,
-      sell_amount: quoteData.sellAmount,
-      buy_amount: quoteData.buyAmount,
-      price: quoteData.price,
-      created_at: createdAt
+      sell_amount: sAmt,
+      buy_amount: bAmt,
+      price: firmPriceResult.price,
+      fee_percent: firmPriceResult.fee_percent,
+      fee_fixed: firmPriceResult.fee_fixed,
+      created_at: createdAt,
     };
 
-    // Cache the quote with TTL
-    quoteCache.set(quoteId, quote, quoteTTL);
+    // ── 6. Persist to Redis (with NodeCache fallback) ─────────────────────────
+    await storeQuote(quote, quoteTTL);
 
-    res.status(201).json(quote);
+    res.status(200).json(quote);
   } catch (error) {
-    console.error("Error in /quote endpoint:", error);
-    res.status(500).json({ error: "Internal server error" } as ErrorResponse);
+    console.error("SEP-38 /quote POST error:", error);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
+// ─── GET /quote/:id ───────────────────────────────────────────────────────────
+
 /**
- * GET /quote/:id
- * 
- * Retrieve a previously created quote by its ID
- * Returns 404 if quote not found, 410 if quote has expired
- * 
- * Path Parameters:
- *   - id: The quote ID returned from POST /quote
+ * Retrieves a stored quote by its UUID.
+ *
+ * Returns:
+ *   200 – Active quote
+ *   404 – Quote was never created (or already deleted)
+ *   410 – Quote found but has expired (removed from cache)
  */
-router.get("/quote/:id", sep38Limiter, (req: Request, res: Response) => {
+router.get("/quote/:id", sep38Limiter, async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    
-    // Validate quote ID format
-    if (!id || typeof id !== "string" || id.trim().length === 0) {
-      return res.status(400).json({ 
-        error: "Invalid quote ID" 
-      } as ErrorResponse);
+
+    // Basic UUID-format check to avoid unnecessary Redis lookups
+    const uuidRegex =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!id || !uuidRegex.test(id)) {
+      return res.status(400).json({ error: "Invalid quote ID format" });
     }
 
-    const quote = quoteCache.get<Quote>(id);
-    
+    const quote = await retrieveQuote(id);
+
     if (!quote) {
-      return res.status(404).json({ error: "Quote not found" } as ErrorResponse);
+      return res.status(404).json({ error: "Quote not found" });
     }
 
-    // Check if quote has expired
-    const now = new Date();
-    const expiresAt = new Date(quote.expires_at);
-    
-    if (now >= expiresAt) {
-      // Remove expired quote from cache
-      quoteCache.del(id);
-      return res.status(410).json({ error: "Quote has expired" } as ErrorResponse);
+    // Double-check expiry (Redis TTL handles cleanup, but belt-and-suspenders)
+    if (new Date() >= new Date(quote.expires_at)) {
+      await deleteQuote(id);
+      return res.status(410).json({ error: "Quote has expired" });
     }
 
     res.json(quote);
   } catch (error) {
-    console.error("Error in /quote/:id endpoint:", error);
-    res.status(500).json({ error: "Internal server error" } as ErrorResponse);
+    console.error("SEP-38 /quote/:id error:", error);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 

@@ -5,7 +5,7 @@ import rateLimit from "express-rate-limit";
 import compression from "compression";
 import dotenv from "dotenv";
 import session from "express-session";
-
+import type { SessionOptions } from "express-session";
 import {
   apiVersionMiddleware,
   validateVersionMiddleware,
@@ -23,6 +23,7 @@ import { bulkRoutes } from "./routes/bulk";
 import { transactionDisputeRoutes, disputeRoutes } from "./routes/disputes";
 import { statsRoutes } from "./routes/stats";
 import { reportsRoutes } from "./routes/reports";
+import { accountingRoutes } from "./routes/accounting";
 import { errorHandler } from "./middleware/errorHandler";
 import {
   connectRedis,
@@ -69,28 +70,31 @@ app.use(metricsMiddleware);
 app.use(helmet());
 
 // Compression middleware
-if (process.env.COMPRESSION_ENABLED !== 'false') {
-  app.use(compression({
-    threshold: parseInt(process.env.COMPRESSION_THRESHOLD || '1024'),
-    level: parseInt(process.env.COMPRESSION_LEVEL || '6'),
-    filter: (req, res) => {
-      if (req.headers['x-no-compression']) {
-        return false;
-      }
-      // Don't compress already compressed content types
-      const contentType = res.getHeader('content-type') as string;
-      if (contentType && (
-        contentType.includes('image/') ||
-        contentType.includes('video/') ||
-        contentType.includes('audio/') ||
-        contentType.includes('application/zip') ||
-        contentType.includes('application/gzip')
-      )) {
-        return false;
-      }
-      return compression.filter(req, res);
-    }
-  }));
+if (process.env.COMPRESSION_ENABLED !== "false") {
+  app.use(
+    compression({
+      threshold: parseInt(process.env.COMPRESSION_THRESHOLD || "1024"),
+      level: parseInt(process.env.COMPRESSION_LEVEL || "6"),
+      filter: (req, res) => {
+        if (req.headers["x-no-compression"]) {
+          return false;
+        }
+        // Don't compress already compressed content types
+        const contentType = res.getHeader("content-type") as string;
+        if (
+          contentType &&
+          (contentType.includes("image/") ||
+            contentType.includes("video/") ||
+            contentType.includes("audio/") ||
+            contentType.includes("application/zip") ||
+            contentType.includes("application/gzip"))
+        ) {
+          return false;
+        }
+        return compression.filter(req, res);
+      },
+    }),
+  );
 }
 
 app.use(cors(createCorsOptions()));
@@ -115,7 +119,7 @@ const sessionSecret =
 const redisStore = createRedisStore();
 
 app.use(
-  session({
+  session(<SessionOptions>{
     store: redisStore,
     secret: sessionSecret,
     resave: false,
@@ -181,25 +185,30 @@ app.use("/api/v1/transactions/bulk", bulkRoutesV1);
 app.use("/api/v1/disputes", disputeRoutesV1);
 app.use("/api/v1/stats", statsRoutesV1);
 
-app.use("/api/transactions", (req: VersionedRequest, res, next) => {
-  req.apiVersion = "v1";
-  res.setHeader("API-Version", "v1");
-  res.setHeader("Deprecation", "true");
-  res.setHeader(
-    "Sunset",
-    new Date(Date.now() + 180 * 24 * 60 * 60 * 1000).toUTCString(),
-  );
-  res.setHeader(
-    "Url",
-    `https://example.com${req.originalUrl.replace("/api/", "/api/v1/")}`,
-  );
-  next();
-}, transactionRoutes);
+app.use(
+  "/api/transactions",
+  (req: VersionedRequest, res, next) => {
+    req.apiVersion = "v1";
+    res.setHeader("API-Version", "v1");
+    res.setHeader("Deprecation", "true");
+    res.setHeader(
+      "Sunset",
+      new Date(Date.now() + 180 * 24 * 60 * 60 * 1000).toUTCString(),
+    );
+    res.setHeader(
+      "Url",
+      `https://example.com${req.originalUrl.replace("/api/", "/api/v1/")}`,
+    );
+    next();
+  },
+  transactionRoutes,
+);
 app.use("/api/transactions", transactionDisputeRoutes);
 app.use("/api/transactions/bulk", bulkRoutes);
 app.use("/api/disputes", disputeRoutes);
 app.use("/api/stats", statsRoutes);
 app.use("/api/reports", reportsRoutes);
+app.use("/api/accounting", accountingRoutes);
 
 app.use(
   (
